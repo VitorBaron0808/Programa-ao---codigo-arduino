@@ -1,0 +1,235 @@
+/* Carrinho_R4WiFi.ino
+   Compatível com Arduino UNO R4 WiFi (verifique o core/board package).
+   Bibliotecas necessárias:
+     - WiFiS3 (core R4 fornece)
+     - ArduinoJson (para parse JSON)
+*/
+// ---------------------- INCLUDES ----------------------
+#include <WiFiS3.h>        // Core do R4 para WiFi (nome pode variar)
+#include <WiFiServer.h>
+#include <WiFiClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+
+// Se integrar TensorFlow Lite Micro:
+// #include "tflite_micro_stub.h"  // (arquivo local com hooks para TFLM)
+
+// ---------------------- CONFIGURAÇÕES DE HARDWARE ----------------------
+// Pinos motores (ajuste conforme seu driver/chassi)
+const int ENA = 5;   // PWM - motor esquerdo
+const int IN1 = 6;   // motor esquerdo direção 1
+const int IN2 = 7;   // motor esquerdo direção 2
+const int IN3 = 8;   // motor direito direção 1
+const int IN4 = 9;   // motor direito direção 2
+const int ENB = 10;  // PWM - motor direito
+
+// Sensor ultrassônico HC-SR04
+const int TRIG_PIN = 2;
+const int ECHO_PIN = 3;
+
+// Parâmetros WiFi - altere para sua rede
+const char* ssid = "REDE_WIFI";
+const char* password = "SENHA_WIFI";
+
+WiFiServer server(80);
+
+// ---------------------- ESTADO DO SISTEMA ----------------------
+String mode = "remote"; // "remote" ou "auto"
+int speedPWM = 200;     // 0..255
+unsigned long lastAutoStep = 0; // para controle não-bloqueante do modo auto
+const unsigned long AUTO_INTERVAL = 100; // ms entre decisões auto
+
+// ---------------------- FUNÇÕES AUXILIARES MOTORES ----------------------
+void mot_stop(){
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+}
+
+void mot_forward(int sp){
+  sp = constrain(sp, 0, 255);
+  analogWrite(ENA, sp);
+  analogWrite(ENB, sp);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void mot_backward(int sp){
+  sp = constrain(sp, 0, 255);
+  analogWrite(ENA, sp);
+  analogWrite(ENB, sp);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+}
+
+void mot_left(int sp){
+  sp = constrain(sp, 0, 255);
+  // roda esquerda para trás, direita para frente -> gira para a esquerda
+  analogWrite(ENA, sp);
+  analogWrite(ENB, sp);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void mot_right(int sp){
+  sp = constrain(sp, 0, 255);
+  // roda esquerda frente, direita trás -> gira para a direita
+  analogWrite(ENA, sp);
+  analogWrite(ENB, sp);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+}
+
+// ---------------------- LEITURA ULTRASSÔNICA ----------------------
+long readDistanceCM(){
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // timeout 30ms
+  long distanceCm = duration / 58; // fórmula aproximada
+  if (duration == 0) return 300; // fora de alcance
+  return distanceCm;
+}
+
+// ---------------------- COMANDO ----------------------
+void handleCommand(const String &cmd, int arg){
+  // arg geralmente corresponde a velocidade PWM (0..255) ou tempo
+  if(cmd == "forward"){
+    mot_forward(arg > 0 ? arg : speedPWM);
+  } else if(cmd == "back"){
+    mot_backward(arg > 0 ? arg : speedPWM);
+  } else if(cmd == "left"){
+    mot_left(arg > 0 ? arg : speedPWM);
+  } else if(cmd == "right"){
+    mot_right(arg > 0 ? arg : speedPWM);
+  } else if(cmd == "stop"){
+    mot_stop();
+  } else if(cmd == "mode_auto"){
+    mode = "auto";
+  } else if(cmd == "mode_remote"){
+    mode = "remote";
+  } else if(cmd == "set_speed"){
+    speedPWM = constrain(arg, 0, 255);
+  } else if(cmd == "ping"){
+    // resposta apenas para checar conectividade
+  } else {
+    // comando não reconhecido -> log
+    Serial.print("Comando desconhecido: ");
+    Serial.println(cmd);
+  }
+}
+
+// ---------------------- PARSE HTTP/JSON (MINIMAL) ----------------------
+// Essa função tenta extrair um JSON do corpo da requisição recebida
+String readRequest(WiFiClient &client){
+  String req = "";
+  unsigned long deadline = millis() + 50;
+  while(client.connected() && millis() < deadline){
+    while(client.available()){
+      char c = client.read();
+      req += c;
+      deadline = millis() + 50;
+    }
+  }
+  return req;
+}
+
+void respondJson(WiFiClient &client, const String &payload){
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: application/json");
+  client.println("Connection: close");
+  client.println();
+  client.println(payload);
+}
+
+// ---------------------- SETUP ----------------------
+void setup(){
+  Serial.begin(115200);
+  // pinos
+  pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT); pinMode(ECHO_PIN, INPUT);
+  mot_stop();
+
+  // WiFi connect
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando WiFi");
+  unsigned long start = millis();
+  while(WiFi.status() != WL_CONNECTED && millis() - start < 20000UL){
+    delay(250); Serial.print(".");
+  }
+  if(WiFi.status() == WL_CONNECTED){
+    Serial.println();
+    Serial.print("Conectado. IP: ");
+    Serial.println(WiFi.localIP());
+    server.begin();
+  } else {
+    Serial.println();
+    Serial.println("Falha ao conectar WiFi (verifique ssid/senha).");
+    // você pode colocar fallback para modo AP aqui
+  }
+
+  // inicialização TinyML (se houver)
+  // tflm_init();
+}
+
+// ---------------------- LOOP PRINCIPAL ----------------------
+void loop(){
+  // 1) checa cliente HTTP
+  WiFiClient client = server.available();
+  if(client){
+    String req = readRequest(client);
+    // tenta achar primeiro '{' para extrair JSON
+    int idx = req.indexOf('{');
+    if(idx >= 0){
+      String body = req.substring(idx);
+      // Limite de 512 bytes - ajuste StaticJsonDocument se mudar
+      StaticJsonDocument<256> doc;
+      DeserializationError err = deserializeJson(doc, body);
+      if(!err){
+        const char* cmd = doc["cmd"] | "";
+        int arg = doc["arg"] | speedPWM;
+        handleCommand(String(cmd), arg);
+      } else {
+        Serial.println("Erro parse JSON");
+      }
+    }
+
+    // resposta: envia modo e leitura do sensor
+    long d = readDistanceCM();
+    String resp = String("{\"mode\":\"") + mode + String("\",\"distance_cm\":") + String(d) + String("}");
+    respondJson(client, resp);
+    delay(1);
+    client.stop();
+  }
+
+  // 2) modo autônomo (não bloqueante)
+  if(mode == "auto"){
+    unsigned long now = millis();
+    if(now - lastAutoStep >= AUTO_INTERVAL){
+      lastAutoStep = now;
+      long d = readDistanceCM();
+      // Se estiver muito próximo, recua e vira; caso contrário segue
+      if(d < 20){
+        // comportamento simples: recua rápido e vira à direita
+        mot_backward(180);
+        delay(300);
+        mot_stop();
+        mot_right(200);
+        delay(300);
+        mot_stop();
+      } else {
+        mot_forward(speedPWM);
+      }
+      // Ponto de entrada para TinyML: você poderia substituir a lógica acima
+      // por uma chamada a tflm_predict() que retorna ações (FORWARD/LEFT/etc).
+      // Exemplo:
+      // int action = tflm_predict(sensor_buffer);
+      // if(action == ACTION_FORWARD) mot_forward(speedPWM);
+    }
+  }
+}
